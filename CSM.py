@@ -80,7 +80,91 @@ def Rot(index,B,chains):
         B[ch[0]:ch[1]] = coordinates[(i+index)%len(chains)]
     return B
 
-def CSM(Sobject, Cn,chains = None, Rotfunc=Rot):
+def calc_rot_axis(B,Cn):
+    """This function calculates the optimal rotation axis following
+    Pinsky et al. 2008.
+    
+    Parameters
+    ----------
+    B:  structure to calculate the rotation on
+    Cn: Symmetry
+    
+    Returns
+    -------
+    rot_axis: 3D vector of the optimal rotation axis
+    
+    """
+    # Calculate the A Matrix following Pinsky et al. 2008
+    Am = zeros((3,3))
+    for rot in range(1,Cn):
+        prefactor = (1 - cos( rot * 2 * pi / Cn ))
+    if prefactor == 0:
+        return None
+    Atmp = zeros((3,3))
+    for k in range(B.n_atoms):
+        Atmp += outer(B.xyz[0][k],B.xyz[rot][k])
+        Atmp += outer(B.xyz[rot][k],B.xyz[0][k])
+    Am += prefactor * Atmp
+    
+    
+    # Calculate the eigenvector and eigenvalues of A
+    eig_val,eig_vec = linalg.eigh(Am)
+    eig_max = argmax(eig_val)
+    
+    
+    # If we have a Cn2 symmetry we are done.
+
+    if Cn == 2:
+        # The eigenvector corresponding to the largest eigenvalue
+        # gives the rotation axis.
+        rot_axis = eig_vec[eig_max]
+        
+    # If we have more subunits than two we need some more 
+    # to calculate the rotation axis.        
+    else: 
+        # Calculate B Matrix (Pinsky et al. 2008)
+        Bm = zeros(3)
+        for rot in range(Cn):
+            prefactor = sin( rot * 2 * pi / Cn )
+            if prefactor == 0:
+                continue
+            Btmp = zeros(3)
+            for k in range(B.n_atoms):
+                Btmp += cross( B.xyz[0][k] , B.xyz[rot][k] )
+            Bm += prefactor * Btmp
+
+        # Get the lambda_max
+        f = lambda lambda_max: sum([(dot(eig_vec[i],Bm)/(eig_val[i]-lambda_max))**2 for i in range(3)])-1
+        # by solving the f function.
+        # The solution is not unique. 
+        # However, by starting by from the largest eigenvalue we get the solution we are looking for.
+        # If we start exactly at the eigenvalue we run into a singularity (hence eig_val + 1).
+        lambda_max = fsolve(f, eig_val[eig_max] +1)
+        m_max = sum([eig_vec[i] * (dot(eig_vec[i],Bm)/(eig_val[i]-lambda_max)) for i in range(3)], axis=0)
+        # And finally we get the optimal rotation axis m_max
+        rot_axis = m_max
+       
+    # END ELSE
+    
+    return rot_axis
+    
+def create_permutations(Cn):
+    """Calculate all possible permutations of the chains.
+    
+    Parameters
+    ----------
+    Cn:  Number of residues
+    
+    Returns
+    -------
+    perm_list: list of residues which have to be permutated.
+    """
+    perm_list = []
+    for i in range(2**(Cn-1)-1):
+        perm_list.append(list(str(int("".join(list(bin(i+1))[2:]))).zfill(Cn)))
+    return perm_list
+
+def CSM(Sobject, Cn,chains = None, Rotfunc=Rot,perm_opt = False):
     """Calculates the continuous symmetry measure as
     defined by Zabrodsky et al. (Continuous Symmetry
     Measures JAmChemSoc 1992, 114, 7843-7851) for the
@@ -139,6 +223,56 @@ def CSM(Sobject, Cn,chains = None, Rotfunc=Rot):
         chains = []
         for i in range(Cn):
             chains.append([atNCn * i,atNCn * (i+1)]) 
+    # Do the optimization if activated:
+    if perm_opt:       
+        # dict of all ambiguous residues with the matching residues
+        ambiguous_atoms = {"VAL":[["CG1","CG2"],["CG2","CG1"]],
+                          "TYR": [["CD1","CD2","CE1","CE2"],["CD2","CD1","CE2","CE1"]],
+                          "ASP": [["OD1","OD2"],["OD2","OD1"]],
+                          "GLU": [["OE1","OE2"],["OE2","OE1"]]}
+
+        table, bonds = Sobject.topology.to_dataframe()
+        # find all residues which are of the type defined in keys
+        keys = ambiguous_atoms.keys()
+        ambiguous_residues = []
+        for key in keys:
+                ambiguous_residues.append(list(unique(table[table.resName == key].resSeq)))
+        ambiguous_residues = [item for sublist in ambiguous_residues for item in sublist]
+
+
+        # Create the lists which atoms have to be exchanged from the original sorting 
+        # for any of the permutations.
+        from_id_list = []
+        to_id_list = []
+        indices_list = []
+
+        perms = create_permutations(Cn)
+        for perm in perms:
+            indices_list.append([i for i, x in enumerate(perm) if x == '1'])
+        # Get the list of chains (indices) which chains have to be relabeled:
+        for indices in indices_list:
+            from_id = []
+            to_id = []
+
+            # And find the atoms to be relabeled for any of the chains:
+            for chain in indices:
+                for sel_res in ambiguous_residues:
+
+                    #First identify the residues:
+                    dfs = table[(table.resSeq == sel_res) & (table.chainID == chain)]
+                    # find the id of the atoms we need to permute from
+                    for at in ambiguous_atoms[unique(dfs.resName)[0]][0]:
+                        from_id.append( dfs[dfs.name == at].index.tolist()[0] )
+
+                    # and to permute to
+                    for at in ambiguous_atoms[unique(dfs.resName)[0]][1]:
+                        to_id.append( dfs[dfs.name == at].index.tolist()[0] )
+                        
+            from_id_list.append(from_id)
+            to_id_list.append(to_id)
+    
+
+    # END OPTIMIZATION
     for t in range(Sobject.n_frames):
 
         # Center COG at (0,0,0)
@@ -150,58 +284,11 @@ def CSM(Sobject, Cn,chains = None, Rotfunc=Rot):
             B.xyz[rot] = Sobject.xyz[t]
             B.xyz[rot] = Rotfunc(rot,B.xyz[rot],chains)
             
-        # Calculate the A Matrix following Pinsky et al. 2008
-        Am = zeros((3,3))
-        for rot in range(1,Cn):
-            prefactor = (1 - cos( rot * 2 * pi / Cn ))
-        if prefactor == 0:
+
+        rot_axis = calc_rot_axis(B,Cn)
+        
+        if rot_axis is None:
             continue
-        Atmp = zeros((3,3))
-        for k in range(B.n_atoms):
-            Atmp += outer(B.xyz[0][k],B.xyz[rot][k])
-            Atmp += outer(B.xyz[rot][k],B.xyz[0][k])
-        Am += prefactor * Atmp
-        
-        
-        # Calculate the eigenvector and eigenvalues of A
-        eig_val,eig_vec = linalg.eigh(Am)
-        eig_max = argmax(eig_val)
-        
-        
-        # If we have a Cn2 symmetry we are done.
-
-        if Cn == 2:
-            # The eigenvector corresponding to the largest eigenvalue
-            # gives the rotation axis.
-            rot_axis = eig_vec[eig_max]
-            
-        # If we have more subunits than two we need some more 
-        # to calculate the rotation axis.        
-        else: 
-            # Calculate B Matrix (Pinsky et al. 2008)
-            Bm = zeros(3)
-            for rot in range(Cn):
-                prefactor = sin( rot * 2 * pi / Cn )
-                if prefactor == 0:
-                    continue
-                Btmp = zeros(3)
-                for k in range(B.n_atoms):
-                    Btmp += cross( B.xyz[0][k] , B.xyz[rot][k] )
-                Bm += prefactor * Btmp
-
-            # Get the lambda_max
-            f = lambda lambda_max: sum([(dot(eig_vec[i],Bm)/(eig_val[i]-lambda_max))**2 for i in range(3)])-1
-            # by solving the f function.
-            # The solution is not unique. 
-            # However, by starting by from the largest eigenvalue we get the solution we are looking for.
-            # If we start exactly at the eigenvalue we run into a singularity (hence eig_val + 1).
-            lambda_max = fsolve(f, eig_val[eig_max] +1)
-            m_max = sum([eig_vec[i] * (dot(eig_vec[i],Bm)/(eig_val[i]-lambda_max)) for i in range(3)], axis=0)
-            # And finally we get the optimal rotation axis m_max
-            rot_axis = m_max
-           
-        # END ELSE
-        
         
         # We rotate around the axis and average over the rotations
         # to get the closest symmetric structure.
@@ -213,19 +300,87 @@ def CSM(Sobject, Cn,chains = None, Rotfunc=Rot):
         # And average over it
         Smean.xyz[t] = B.xyz.mean(axis=0)
         
+        
+        # optimize if activated:
+        if perm_opt:
+            rmsd_list = []
+            B_opt = B[0]
+
+            for i, sel_res in enumerate(ambiguous_residues):
+                indlist = table[(table.resSeq == sel_res)].index.tolist()
+                rmsd_list.append(sum((Smean.atom_slice(indlist).xyz[t] - B.atom_slice(indlist).xyz[0])**2))
+                
+            for from_id,to_id in zip(from_id_list,to_id_list):
+                # Do the permutation
+                chains_to_perm = []
+                
+                # reset B
+                for rot in range(Cn):
+                    B.xyz[rot] = Sobject.xyz[t]
+                    B.xyz[rot][to_id] = B[rot].xyz[0][from_id]
+                    # And do the rotation again
+                    B.xyz[rot] = Rotfunc(rot,B.xyz[rot],chains)
+                    
+                for rot in range(1,Cn):
+                    # Calculate rotation matrix around rot_axis by an angle of rot*360/Cn
+                    RMat = RMatrix_Axis_Angle([rot_axis],[ rot * 360./Cn ],deg=True)
+                    # Do the rotation using this matrix
+                    B.xyz[rot] = einsum("tnc,tcp->tnp",B[rot].xyz,RMat,casting='same_kind')
+                    
+                # Calculate the new Mean
+                Smean.xyz[t] = B.xyz.mean(axis=0)
+                
+                # Calculate the distance for all relevant residues
+                for i, sel_res in enumerate(ambiguous_residues):
+                    indlist = table[(table.resSeq == sel_res)].index.tolist()
+                    rmsd = sum((Smean.xyz[t][indlist] - B.xyz[0][indlist])**2)
+                
+                    # Compare new distance value to old one
+                    # and than replace the residue in Smean
+                    # and in the optimized B
+                    if rmsd_list[i] > rmsd:
+                        rmsd_list[i] = rmsd
+                        B_opt.xyz[0][indlist] = B[0].xyz[0][indlist]
+
+                        
+            # calculate the new optimal rotation axis
+            for rot in range(Cn):
+                B.xyz[rot] = B_opt.xyz[0]
+                B.xyz[rot] = Rotfunc(rot,B.xyz[rot],chains)
+
+
+            rot_axis = calc_rot_axis(B,Cn)
+
+            #if rot_axis is None:
+            #    continue
+                
+            # calculate the S value from the optimal value
+            # We rotate around the axis and average over the rotations
+            # to get the closest symmetric structure.
+            for rot in range(1,Cn):
+                # Calculate rotation matrix around rot_axis by an angle of rot*360/Cn
+                RMat = RMatrix_Axis_Angle([rot_axis],[ rot * 360./Cn ],deg=True)
+                # Do the rotation using this matrix
+                B.xyz[rot] = einsum("tnc,tcp->tnp",B[rot].xyz,RMat,casting='same_kind')
+            # And average over it
+            Smean.xyz[t] = B.xyz.mean(axis=0)
+                    
+        
+        # END OPT
+        
         # d_sq: Square of root mean square size of the object.
         #       Used to calculate the correct normalization of the CSM.
-        d_sq = sum(Sobject.xyz[t] ** 2)
+        d_sq = sum(B.xyz[0] ** 2)
         
         # CSM: Is the distance of the original object to the closest
         #      symmetric object (Smean) with a normalization.
         #      
-        S = [t, 100./d_sq * sum((Sobject.xyz[t] - Smean.xyz[t]) ** 2)]
+        S = [t, 100./d_sq * sum((B.xyz[0] - Smean.xyz[t]) ** 2)]
         
         # The CSM can also be calculated based on the individual subunits.
         # By this the individual contributions to the asymmetry can be detected.
         for ch in chains:
-            S.append(100./d_sq * sum((Sobject.xyz[t,ch[0]:ch[1]] - Smean.xyz[t,ch[0]:ch[1]]) ** 2))
+            S.append(100./d_sq * sum((B.xyz[0,ch[0]:ch[1]] - Smean.xyz[t,ch[0]:ch[1]]) ** 2))
         Sn.append(S)
             
 
@@ -235,7 +390,6 @@ def CSM(Sobject, Cn,chains = None, Rotfunc=Rot):
             pb.advance()
     if pbb:
         pb.finish()
-    
     return array(Sn),Smean
     
 if __name__ == "__main__":
@@ -246,6 +400,7 @@ if __name__ == "__main__":
     parser.add_option("-o","--outtxt", dest="outtxt", default="asym.txt", help="output file of asymmetry measure")
     parser.add_option("-e","--outxtc", dest="outxtc", default="asym.xtc", help="output file for symmetric trajectory")
     parser.add_option("-c","--chains", dest="chains", default=None, help="list of chains if sorting is non standard from atom to atom usage: -c '[[0,10],[20,30],[10,20]]'")
+    parser.add_option("-p","--permutations", dest="permutations", action="store_true", default=False, help="Use permeation optimization of ambiguous residues.")
     (options,args) = parser.parse_args()
  
     try:
@@ -258,13 +413,13 @@ if __name__ == "__main__":
     
     print "calculating symmetry measure ..."    
     if options.chains == None:
-        csm = CSM(traj, sub)
+        csm = CSM(traj, sub,perm_opt=options.permutations)
     else:
         try:
             chains = eval(options.chains)
         except:
             raise IOError("Could not convert chains to list")
-        csm = CSM(traj, sub, eval(options.chains))
+        csm = CSM(traj, sub, eval(options.chains), perm_opt=options.permutations)
 
     print "writing CSM measure to " + options.outtxt        
     savetxt(options.outtxt, csm[0],header="# CSM overall, CSM for subunits")
