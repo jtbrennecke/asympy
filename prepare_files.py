@@ -98,14 +98,18 @@ if __name__ == "__main__":
         dat = loadtxt(options.data)
     except:
         raise IOError("-d file could not be loaded")
+
+    if options.chains == None:
+        print "processing files..."
+        res = prepare_files(traj,dat,sub,chains = None, Rotfunc=Rot)
     
-    try:
-        chains = eval(options.chains)
-    except:
-        raise IOError("Could not convert chains to list")
-    
-    print "processing files..."
-    res = prepare_files(traj,dat,sub,chains = None, Rotfunc=Rot)
+    else:
+        try:
+       	    chains = eval(options.chains)
+        except:
+            raise IOError("Could not convert chains to list")
+        print "processing files..."
+        res = prepare_files(traj,dat,sub,chains = chains, Rotfunc=Rot)
     
     print "saving xtc to " + options.xtcout
     res[0].save_xtc(options.xtcout)
